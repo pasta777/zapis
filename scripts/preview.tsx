@@ -12,7 +12,7 @@
 
 import { renderToStaticMarkup } from "react-dom/server";
 import { readFileSync, writeFileSync } from "node:fs";
-import { openDb, listEntries, getSettings, listPeople } from "../server/db.ts";
+import { openDb, listEntries, getSettings, listPeople, listUsers } from "../server/db.ts";
 import { I18nProvider } from "../src/i18n/index.tsx";
 import { Sheet } from "../src/features/sheet/Sheet.tsx";
 import { Ledger } from "../src/features/ledger/Ledger.tsx";
@@ -28,8 +28,19 @@ import type { Lang } from "../src/domain/types.ts";
 
 const OUT = process.argv[2] ?? "preview.html";
 const db = openDb(process.env.DB_PATH ?? "./data/dev.db");
-const settings = getSettings(db);
-const entries = listEntries(db);
+
+// Renders whichever account the database happens to hold; with several, pass
+// PREVIEW_USER_ID to choose. A preview is a developer tool, so it reads
+// directly rather than going through the API's auth.
+const users = listUsers(db);
+const userId = Number(process.env.PREVIEW_USER_ID ?? users[0]?.id ?? 0);
+if (!userId) {
+  console.error("no accounts in this database — run 'npm run seed' first");
+  process.exit(1);
+}
+
+const settings = getSettings(db, userId);
+const entries = listEntries(db, userId);
 const today = todayISO();
 
 const stats = {
@@ -47,7 +58,7 @@ const study = {
   lagXp: lagCorrelations(entries, "totalXp"),
   sleep: sleepLagCorrelation(entries, "mood"),
   pairedDays: pairedDayCount(entries),
-  people: listPeople(db),
+  people: listPeople(db, userId),
   chapters: detectChapters(entries),
 };
 

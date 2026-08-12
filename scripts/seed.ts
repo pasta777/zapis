@@ -16,17 +16,34 @@
    the sleep line appears every day, and sleep is Body upkeep.
    ──────────────────────────────────────────────────────────────── */
 
-import { openDb, insertEntry } from "../server/db.ts";
+import { openDb, insertEntry, createUser, findUserByHandle } from "../server/db.ts";
 import { extract, buildCueTable } from "../src/domain/extract/index.ts";
 import { shiftISO, todayISO } from "../src/domain/dates.ts";
 import { listCues } from "../server/db.ts";
+import { hashPassword } from "../server/auth.ts";
+import { refreshScores } from "../server/scores.ts";
 
 const DAYS = Number(process.argv[2] ?? 100);
 const DB_PATH = process.env.DB_PATH ?? "./data/dev.db";
+const HANDLE = process.env.SEED_HANDLE ?? "seed";
+const PASSWORD = process.env.SEED_PASSWORD ?? "seedseed";
 
 const db = openDb(DB_PATH);
+
+// Entries belong to somebody now, so the seed needs an account to hang them
+// on. Re-running against the same database reuses it.
+const user =
+  findUserByHandle(db, HANDLE) ??
+  createUser(db, {
+    handle: HANDLE,
+    display: process.env.SEED_DISPLAY ?? "Seed",
+    passwordHash: await hashPassword(PASSWORD),
+  });
+
 const table = buildCueTable(
-  listCues(db).map((c) => ({ lang: c.lang, track: c.track, stem: c.stem, weight: c.weight })),
+  listCues(db, user.id).map((c) => ({
+    lang: c.lang, track: c.track, stem: c.stem, weight: c.weight,
+  })),
 );
 
 /** Deterministic PRNG, so a seeded database is reproducible. */
@@ -140,7 +157,7 @@ for (let i = 0; i < DAYS; i++) {
   const text = parts.join(" ");
   const draft = extract(text, { cueTable: table, fallbackLang: "sr" });
 
-  insertEntry(db, {
+  insertEntry(db, user.id, {
     date,
     text,
     lang: draft.lang,

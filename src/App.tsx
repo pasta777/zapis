@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
-import { api, type StatsResponse, type StudyResponse } from "./api/client.ts";
+import {
+  api, NotAuthedError,
+  type Account, type AccountSettings, type StatsResponse, type StudyResponse,
+} from "./api/client.ts";
 import { I18nProvider, useT } from "./i18n/index.tsx";
 import { Record } from "./features/record/Record.tsx";
 import { Sheet } from "./features/sheet/Sheet.tsx";
@@ -10,21 +13,24 @@ import { Quests } from "./features/quests/Quests.tsx";
 import { People } from "./features/people/People.tsx";
 import { Lexicon } from "./features/lexicon/Lexicon.tsx";
 import { Data } from "./features/data/Data.tsx";
-import type { Alert, Entry, Lang, Settings } from "./domain/types.ts";
+import { Board } from "./features/board/Board.tsx";
+import { SignIn } from "./features/auth/SignIn.tsx";
+import type { Alert, Entry, Lang } from "./domain/types.ts";
 
 const TABS = [
   "record", "sheet", "ledger", "study",
-  "review", "quests", "people", "lexicon", "data",
+  "review", "quests", "people", "board", "lexicon", "data",
 ] as const;
 
 type Tab = (typeof TABS)[number];
 
-const DEFAULT_SETTINGS: Settings = {
+const DEFAULT_SETTINGS: AccountSettings = {
   lang: "en",
   halfLife: 14,
   xpScale: 7.5,
   notify: false,
   restDays: false,
+  shareScores: true,
 };
 
 const LANG_CACHE_KEY = "zapis:lang";
@@ -44,12 +50,14 @@ function cachedLang(): Lang {
 }
 
 export default function App() {
-  const [settings, setSettings] = useState<Settings>({
+  const [settings, setSettings] = useState<AccountSettings>({
     ...DEFAULT_SETTINGS,
     lang: cachedLang(),
   });
+  /** undefined while the session is still being checked. */
+  const [user, setUser] = useState<Account | null | undefined>(undefined);
 
-  useEffect(() => {
+  const loadSettings = useCallback(() => {
     api
       .settings()
       .then((s) => {
@@ -65,7 +73,23 @@ export default function App() {
       });
   }, []);
 
-  const update = (s: Settings) => {
+  // One round trip decides which of the two screens to draw. Rendering the app
+  // first and swapping to the gate on the first 401 would flash the shell of a
+  // journal at someone who isn't signed in.
+  useEffect(() => {
+    api
+      .me()
+      .then(({ user: u }) => {
+        setUser(u);
+        loadSettings();
+      })
+      .catch((err) => {
+        if (err instanceof NotAuthedError) setUser(null);
+        else setUser(null);
+      });
+  }, [loadSettings]);
+
+  const update = (s: AccountSettings) => {
     setSettings(s);
     try {
       localStorage.setItem(LANG_CACHE_KEY, s.lang);
@@ -74,9 +98,36 @@ export default function App() {
     }
   };
 
+  if (user === undefined) {
+    return (
+      <I18nProvider lang={settings.lang}>
+        <div className="ll ll-gate" />
+      </I18nProvider>
+    );
+  }
+
+  if (user === null) {
+    return (
+      <I18nProvider lang={settings.lang}>
+        <SignIn
+          onSignedIn={(u) => {
+            setUser(u);
+            loadSettings();
+          }}
+        />
+      </I18nProvider>
+    );
+  }
+
   return (
     <I18nProvider lang={settings.lang}>
-      <Shell settings={settings} setSettings={update} />
+      <Shell
+        key={user.id}
+        user={user}
+        settings={settings}
+        setSettings={update}
+        onSignedOut={() => setUser(null)}
+      />
     </I18nProvider>
   );
 }
@@ -93,11 +144,15 @@ function tabFromHash(): Tab {
 }
 
 function Shell({
+  user,
   settings,
   setSettings,
+  onSignedOut,
 }: {
-  settings: Settings;
-  setSettings: (s: Settings) => void;
+  user: Account;
+  settings: AccountSettings;
+  setSettings: (s: AccountSettings) => void;
+  onSignedOut: () => void;
 }) {
   const t = useT();
   const [tab, setTab] = useState<Tab>(tabFromHash);
@@ -144,9 +199,15 @@ function Shell({
       setOnThisDay(otd);
       setError("");
     } catch (err) {
+      // A session that expired mid-use drops back to the gate rather than
+      // filling the screen with "not signed in" on every panel.
+      if (err instanceof NotAuthedError) {
+        onSignedOut();
+        return;
+      }
       setError(err instanceof Error ? err.message : String(err));
     }
-  }, []);
+  }, [onSignedOut]);
 
   useEffect(() => {
     void refresh();
@@ -179,10 +240,18 @@ function Shell({
     }
   }, [alerts, settings.notify, notified, t]);
 
-  const saveSettings = async (patch: Partial<Settings>) => {
+  const saveSettings = async (patch: Partial<AccountSettings>) => {
     const next = await api.saveSettings(patch);
     setSettings(next);
     await refresh();
+  };
+
+  const signOut = async () => {
+    try {
+      await api.logout();
+    } finally {
+      onSignedOut();
+    }
   };
 
   const dismiss = async (id: number) => {
@@ -212,6 +281,13 @@ function Shell({
             onClick={() => saveSettings({ lang: settings.lang === "en" ? "sr" : "en" })}
           >
             {settings.lang === "en" ? "SR" : "EN"}
+          </button>
+          <i>·</i>
+          <span className="ll-who" title={`${t.t("signedInAs")} ${user.handle}`}>
+            {user.display}
+          </span>
+          <button className="ll-ghost sm" type="button" onClick={() => void signOut()}>
+            {t.t("signOut")}
           </button>
         </div>
       </header>
@@ -263,6 +339,7 @@ function Shell({
       {tab === "review" && <Review />}
       {tab === "quests" && <Quests onChanged={() => void refresh()} />}
       {tab === "people" && <People />}
+      {tab === "board" && <Board />}
       {tab === "lexicon" && <Lexicon onChanged={() => void refresh()} />}
       {tab === "data" && (
         <Data

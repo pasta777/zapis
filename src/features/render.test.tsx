@@ -23,19 +23,22 @@ import { Quests } from "./quests/Quests.tsx";
 import { People } from "./people/People.tsx";
 import { Lexicon } from "./lexicon/Lexicon.tsx";
 import { Data } from "./data/Data.tsx";
+import { Board } from "./board/Board.tsx";
+import { SignIn } from "./auth/SignIn.tsx";
 import { Radar } from "./shared/Radar.tsx";
 import { Heat, YearHeat } from "./shared/Heat.tsx";
 import { emptyAwards, TRACK_KEYS } from "../domain/tracks.ts";
 import { computeStats } from "../domain/stats.ts";
 import { lagCorrelations, sameDayCorrelations } from "../domain/correlate.ts";
 import { lastNDays, shiftISO } from "../domain/dates.ts";
-import type { StatsResponse, StudyResponse } from "../api/client.ts";
-import type { Entry, Lang, Settings } from "../domain/types.ts";
+import type { AccountSettings, StatsResponse, StudyResponse } from "../api/client.ts";
+import type { Entry, Lang } from "../domain/types.ts";
 
 /* ── fixtures ───────────────────────────────────────────────────── */
 
-const settings: Settings = {
+const settings: AccountSettings = {
   lang: "en", halfLife: 14, xpScale: 7.5, notify: false, restDays: false,
+  shareScores: true,
 };
 
 function entries(): Entry[] {
@@ -194,6 +197,20 @@ describe("every tab renders", () => {
         expect(html).toContain("ll-settingrow");
         expect(html).toContain("zapis.json");
       });
+
+      it("Board", () => {
+        // Effects don't run here, so this is the pre-fetch state: the chip row
+        // and the privacy note must be there before any data arrives.
+        const html = render(<Board />, lang);
+        expect(html).toContain("ll-chips");
+        expect(html).toContain("ll-note");
+      });
+
+      it("SignIn", () => {
+        const html = render(<SignIn onSignedIn={() => {}} />, lang);
+        expect(html).toContain("ll-signin");
+        expect(html).toContain('type="password"');
+      });
     });
   }
 
@@ -222,12 +239,17 @@ describe("every tab renders", () => {
         render(<Ledger entries={es} onDeleted={() => {}} />, lang),
         render(<Data settings={{ ...settings, lang }} onSettings={() => {}} onImported={() => {}} />, lang),
         render(<Quests onChanged={() => {}} />, lang),
+        render(<Board />, lang),
+        render(<SignIn onSignedIn={() => {}} />, lang),
       ].join("");
 
       // A missing key falls back to the key itself, which is always
       // lowerCamelCase — so any bare camelCase token in the output is a hole
       // in the dictionary.
-      for (const key of ["needMoreDays", "pairedDays", "exportJson", "halfLife", "questTitle"]) {
+      for (const key of [
+        "needMoreDays", "pairedDays", "exportJson", "halfLife", "questTitle",
+        "signIn", "password", "overall", "boardBlurb", "shareScores",
+      ]) {
         expect(html, `${key} should be translated in ${lang}`).not.toContain(`>${key}<`);
       }
     }

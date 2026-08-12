@@ -1,0 +1,45 @@
+#  Fly.io deployment.
+#
+#  Rename `app` to something unique before the first deploy, or let
+#  `fly launch` write it for you.
+
+app = "zapis-ignjatovic"
+primary_region = "fra"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  DB_PATH = "/data/zapis.db"
+
+#  SQLite is a file on a disk, not a network service: the journal only
+#  survives a redeploy because of this volume.
+[mounts]
+  source = "zapis_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  #  One machine, deliberately. Two would each open the same SQLite file
+  #  on their own volume and silently diverge into two different journals.
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 40
+    hard_limit = 80
+
+[[http_service.checks]]
+  grace_period = "10s"
+  interval = "30s"
+  method = "GET"
+  timeout = "5s"
+  path = "/api/health"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

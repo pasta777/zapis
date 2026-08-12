@@ -42,10 +42,13 @@ export function openDb(path: string): DB {
 
   const db = new Database(path);
   db.pragma("journal_mode = WAL");
-  db.pragma("foreign_keys = ON");
+  // Off for the duration of the migration: rebuilding a table means dropping
+  // one that children still reference, which enforcement would reject. This
+  // is SQLite's documented procedure, and it must be set outside any
+  // transaction — the pragma is a silent no-op inside one.
+  db.pragma("foreign_keys = OFF");
   migrate(db);
-  seedCues(db);
-  seedSettings(db);
+  db.pragma("foreign_keys = ON");
   return db;
 }
 
@@ -65,44 +68,45 @@ function migrate(db: DB): void {
   }
 }
 
-/** Load the seed lexicon on first run. Existing rows are never overwritten. */
-function seedCues(db: DB): void {
-  const count = db.prepare(`SELECT COUNT(*) AS n FROM cues`).get() as { n: number };
-  if (count.n > 0) return;
-
+/**
+ * Give a new account its own copy of the seed lexicon.
+ *
+ * Copied per user rather than shared, because the lexicon is not reference
+ * data — it learns from corrections. A shared table would mean your nudging
+ * "deploy" towards Craft silently reweights everyone else's journal.
+ */
+function seedCues(db: DB, userId: number): void {
   const insert = db.prepare(
-    `INSERT OR IGNORE INTO cues (lang, track, stem, weight, seed_weight, source)
-     VALUES (?, ?, ?, ?, ?, 'seed')`,
+    `INSERT OR IGNORE INTO cues (user_id, lang, track, stem, weight, seed_weight, source)
+     VALUES (?, ?, ?, ?, ?, ?, 'seed')`,
   );
 
-  db.transaction(() => {
-    for (const track of TRACK_KEYS) {
-      for (const lang of ["en", "sr"] as Lang[]) {
-        for (const seed of CUE_SEED[track][lang]) {
-          const s = stem(seed.word, lang);
-          if (s.length < 2) continue;
-          insert.run(lang, track, s, seed.weight, seed.weight);
-        }
+  for (const track of TRACK_KEYS) {
+    for (const lang of ["en", "sr"] as Lang[]) {
+      for (const seed of CUE_SEED[track][lang]) {
+        const s = stem(seed.word, lang);
+        if (s.length < 2) continue;
+        insert.run(userId, lang, track, s, seed.weight, seed.weight);
       }
     }
-  })();
+  }
 }
 
-function seedSettings(db: DB): void {
+function seedSettings(db: DB, userId: number): void {
   const insert = db.prepare(
-    `INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)`,
+    `INSERT OR IGNORE INTO settings (user_id, key, value) VALUES (?, ?, ?)`,
   );
-  db.transaction(() => {
-    for (const [k, v] of Object.entries(DEFAULT_SETTINGS)) {
-      insert.run(k, JSON.stringify(v));
-    }
-  })();
+  for (const [k, v] of Object.entries(DEFAULT_SETTINGS)) {
+    insert.run(userId, k, JSON.stringify(v));
+  }
 }
 
 /* ── settings ───────────────────────────────────────────────────── */
 
-export function getSettings(db: DB): Settings {
-  const rows = db.prepare(`SELECT key, value FROM settings`).all() as {
+export function getSettings(db: DB, userId: number): Settings {
+  const rows = db
+    .prepare(`SELECT key, value FROM settings WHERE user_id = ?`)
+    .all(userId) as {
     key: string;
     value: string;
   }[];
@@ -117,18 +121,140 @@ export function getSettings(db: DB): Settings {
   return out as unknown as Settings;
 }
 
-export function setSettings(db: DB, patch: Partial<Settings>): Settings {
+export function setSettings(db: DB, userId: number, patch: Partial<Settings>): Settings {
   const stmt = db.prepare(
-    `INSERT INTO settings (key, value) VALUES (?, ?)
-     ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+    `INSERT INTO settings (user_id, key, value) VALUES (?, ?, ?)
+     ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value`,
   );
   db.transaction(() => {
     for (const [k, v] of Object.entries(patch)) {
       if (v === undefined) continue;
-      stmt.run(k, JSON.stringify(v));
+      stmt.run(userId, k, JSON.stringify(v));
     }
   })();
-  return getSettings(db);
+  return getSettings(db, userId);
+}
+
+/* ── accounts ───────────────────────────────────────────────────── */
+
+export interface User {
+  id: number;
+  handle: string;
+  display: string;
+  shareScores: boolean;
+  createdAt: string;
+}
+
+interface UserRow {
+  id: number;
+  handle: string;
+  display: string;
+  password_hash: string;
+  created_at: string;
+  share_scores: number;
+}
+
+function toUser(r: UserRow): User {
+  return {
+    id: r.id,
+    handle: r.handle,
+    display: r.display,
+    shareScores: r.share_scores === 1,
+    createdAt: r.created_at,
+  };
+}
+
+/** Handles are matched case-insensitively; the stored form is lowercase. */
+export function normaliseHandle(handle: string): string {
+  return handle.trim().toLowerCase();
+}
+
+export function createUser(
+  db: DB,
+  input: { handle: string; display: string; passwordHash: string },
+): User {
+  return db.transaction(() => {
+    const info = db
+      .prepare(
+        `INSERT INTO users (handle, display, password_hash, created_at)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .run(
+        normaliseHandle(input.handle),
+        input.display.trim(),
+        input.passwordHash,
+        new Date().toISOString(),
+      );
+    const id = Number(info.lastInsertRowid);
+    seedCues(db, id);
+    seedSettings(db, id);
+    return getUser(db, id)!;
+  })();
+}
+
+export function getUser(db: DB, id: number): User | null {
+  const row = db.prepare(`SELECT * FROM users WHERE id = ?`).get(id) as
+    | UserRow
+    | undefined;
+  return row ? toUser(row) : null;
+}
+
+export function findUserByHandle(db: DB, handle: string): (User & { passwordHash: string }) | null {
+  const row = db.prepare(`SELECT * FROM users WHERE handle = ?`).get(normaliseHandle(handle)) as
+    | UserRow
+    | undefined;
+  return row ? { ...toUser(row), passwordHash: row.password_hash } : null;
+}
+
+export function setPasswordHash(db: DB, userId: number, hash: string): boolean {
+  return db.prepare(`UPDATE users SET password_hash = ? WHERE id = ?`).run(hash, userId)
+    .changes > 0;
+}
+
+export function setShareScores(db: DB, userId: number, share: boolean): void {
+  db.prepare(`UPDATE users SET share_scores = ? WHERE id = ?`).run(share ? 1 : 0, userId);
+}
+
+export function listUsers(db: DB): User[] {
+  return (db.prepare(`SELECT * FROM users ORDER BY id`).all() as UserRow[]).map(toUser);
+}
+
+/* ── sessions ───────────────────────────────────────────────────── */
+
+export function createSession(
+  db: DB,
+  userId: number,
+  token: string,
+  ttlDays: number,
+): void {
+  const now = Date.now();
+  db.prepare(
+    `INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)`,
+  ).run(
+    token,
+    userId,
+    new Date(now).toISOString(),
+    new Date(now + ttlDays * 86_400_000).toISOString(),
+  );
+}
+
+/** Resolve a session token to its user, treating an expired row as absent. */
+export function userForSession(db: DB, token: string): User | null {
+  const row = db
+    .prepare(
+      `SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id
+       WHERE s.token = ? AND s.expires_at > ?`,
+    )
+    .get(token, new Date().toISOString()) as UserRow | undefined;
+  return row ? toUser(row) : null;
+}
+
+export function deleteSession(db: DB, token: string): void {
+  db.prepare(`DELETE FROM sessions WHERE token = ?`).run(token);
+}
+
+export function purgeExpiredSessions(db: DB): void {
+  db.prepare(`DELETE FROM sessions WHERE expires_at <= ?`).run(new Date().toISOString());
 }
 
 /* ── entries ────────────────────────────────────────────────────── */
@@ -237,17 +363,17 @@ function hydrate(db: DB, rows: readonly EntryRow[]): Entry[] {
   return rows.map((r) => byId.get(r.id)!);
 }
 
-export function listEntries(db: DB): Entry[] {
+export function listEntries(db: DB, userId: number): Entry[] {
   const rows = db
-    .prepare(`SELECT * FROM entries ORDER BY date DESC, id DESC`)
-    .all() as EntryRow[];
+    .prepare(`SELECT * FROM entries WHERE user_id = ? ORDER BY date DESC, id DESC`)
+    .all(userId) as EntryRow[];
   return hydrate(db, rows);
 }
 
-export function getEntry(db: DB, id: number): Entry | null {
-  const row = db.prepare(`SELECT * FROM entries WHERE id = ?`).get(id) as
-    | EntryRow
-    | undefined;
+export function getEntry(db: DB, userId: number, id: number): Entry | null {
+  const row = db
+    .prepare(`SELECT * FROM entries WHERE id = ? AND user_id = ?`)
+    .get(id, userId) as EntryRow | undefined;
   if (!row) return null;
   return hydrate(db, [row])[0] ?? null;
 }
@@ -269,14 +395,15 @@ export interface EntryInput {
 }
 
 /** Insert an entry and everything hanging off it, atomically. */
-export function insertEntry(db: DB, input: EntryInput): Entry {
+export function insertEntry(db: DB, userId: number, input: EntryInput): Entry {
   const id = db.transaction(() => {
     const info = db
       .prepare(
-        `INSERT INTO entries (date, text, lang, mood, energy, note, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO entries (user_id, date, text, lang, mood, energy, note, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
+        userId,
         input.date,
         input.text,
         input.lang,
@@ -286,21 +413,30 @@ export function insertEntry(db: DB, input: EntryInput): Entry {
         input.createdAt ?? new Date().toISOString(),
       );
     const entryId = Number(info.lastInsertRowid);
-    writeChildren(db, entryId, input);
+    writeChildren(db, userId, entryId, input);
     return entryId;
   })();
 
-  return getEntry(db, id)!;
+  return getEntry(db, userId, id)!;
 }
 
-export function updateEntry(db: DB, id: number, input: EntryInput): Entry | null {
-  const exists = db.prepare(`SELECT id FROM entries WHERE id = ?`).get(id);
+export function updateEntry(
+  db: DB,
+  userId: number,
+  id: number,
+  input: EntryInput,
+): Entry | null {
+  // Ownership is checked here rather than trusted from the route, so a guessed
+  // id in the URL cannot reach another account's entry.
+  const exists = db
+    .prepare(`SELECT id FROM entries WHERE id = ? AND user_id = ?`)
+    .get(id, userId);
   if (!exists) return null;
 
   db.transaction(() => {
     db.prepare(
       `UPDATE entries SET date = ?, text = ?, lang = ?, mood = ?, energy = ?,
-              note = ?, edited_at = ? WHERE id = ?`,
+              note = ?, edited_at = ? WHERE id = ? AND user_id = ?`,
     ).run(
       input.date,
       input.text,
@@ -310,19 +446,25 @@ export function updateEntry(db: DB, id: number, input: EntryInput): Entry | null
       input.note,
       new Date().toISOString(),
       id,
+      userId,
     );
     db.prepare(`DELETE FROM entry_awards  WHERE entry_id = ?`).run(id);
     db.prepare(`DELETE FROM entry_people  WHERE entry_id = ?`).run(id);
     db.prepare(`DELETE FROM entry_tags    WHERE entry_id = ?`).run(id);
     db.prepare(`DELETE FROM entry_events  WHERE entry_id = ?`).run(id);
     db.prepare(`DELETE FROM entry_metrics WHERE entry_id = ?`).run(id);
-    writeChildren(db, id, input);
+    writeChildren(db, userId, id, input);
   })();
 
-  return getEntry(db, id);
+  return getEntry(db, userId, id);
 }
 
-function writeChildren(db: DB, entryId: number, input: EntryInput): void {
+function writeChildren(
+  db: DB,
+  userId: number,
+  entryId: number,
+  input: EntryInput,
+): void {
   const award = db.prepare(
     `INSERT INTO entry_awards (entry_id, track, xp, auto_xp) VALUES (?, ?, ?, ?)`,
   );
@@ -334,14 +476,14 @@ function writeChildren(db: DB, entryId: number, input: EntryInput): void {
   }
 
   for (const name of input.people) {
-    const personId = upsertPerson(db, name, input.date);
+    const personId = upsertPerson(db, userId, name, input.date);
     db.prepare(
       `INSERT OR IGNORE INTO entry_people (entry_id, person_id) VALUES (?, ?)`,
     ).run(entryId, personId);
   }
 
   for (const tag of input.tags) {
-    const tagId = upsertTag(db, tag.stem, tag.display, input.lang);
+    const tagId = upsertTag(db, userId, tag.stem, tag.display, input.lang);
     db.prepare(
       `INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?, ?)`,
     ).run(entryId, tagId);
@@ -359,8 +501,10 @@ function writeChildren(db: DB, entryId: number, input: EntryInput): void {
   for (const m of input.metrics) met.run(entryId, m.kind, m.value, m.unit, m.track);
 }
 
-export function deleteEntry(db: DB, id: number): boolean {
-  const info = db.prepare(`DELETE FROM entries WHERE id = ?`).run(id);
+export function deleteEntry(db: DB, userId: number, id: number): boolean {
+  const info = db
+    .prepare(`DELETE FROM entries WHERE id = ? AND user_id = ?`)
+    .run(id, userId);
   return info.changes > 0;
 }
 
@@ -378,13 +522,21 @@ export function deleteEntry(db: DB, id: number): boolean {
  * The first spelling seen becomes the display name; later variants are
  * recorded as aliases so the registry gets better at recognising them.
  */
-export function upsertPerson(db: DB, display: string, seenOn: string): number {
+export function upsertPerson(
+  db: DB,
+  userId: number,
+  display: string,
+  seenOn: string,
+): number {
   const canonical = fold(display);
   const base = nameBase(display);
 
   const candidates = db
-    .prepare(`SELECT id, canonical, display, aliases, first_seen, last_seen FROM people`)
-    .all() as {
+    .prepare(
+      `SELECT id, canonical, display, aliases, first_seen, last_seen FROM people
+       WHERE user_id = ?`,
+    )
+    .all(userId) as {
     id: number;
     canonical: string;
     display: string;
@@ -423,10 +575,10 @@ export function upsertPerson(db: DB, display: string, seenOn: string): number {
 
   const info = db
     .prepare(
-      `INSERT INTO people (canonical, display, aliases, first_seen, last_seen)
-       VALUES (?, ?, '[]', ?, ?)`,
+      `INSERT INTO people (user_id, canonical, display, aliases, first_seen, last_seen)
+       VALUES (?, ?, ?, '[]', ?, ?)`,
     )
-    .run(canonical, display, seenOn, seenOn);
+    .run(userId, canonical, display, seenOn, seenOn);
   return Number(info.lastInsertRowid);
 }
 
@@ -449,14 +601,15 @@ export function addPersonAlias(db: DB, personId: number, alias: string): void {
   );
 }
 
-export function listPeople(db: DB): Person[] {
+export function listPeople(db: DB, userId: number): Person[] {
   const rows = db
     .prepare(
       `SELECT p.*, COUNT(ep.entry_id) AS appearances
        FROM people p LEFT JOIN entry_people ep ON ep.person_id = p.id
+       WHERE p.user_id = ?
        GROUP BY p.id ORDER BY appearances DESC, p.display`,
     )
-    .all() as {
+    .all(userId) as {
     id: number;
     canonical: string;
     display: string;
@@ -477,29 +630,36 @@ export function listPeople(db: DB): Person[] {
   }));
 }
 
-export function deletePerson(db: DB, id: number): boolean {
-  return db.prepare(`DELETE FROM people WHERE id = ?`).run(id).changes > 0;
+export function deletePerson(db: DB, userId: number, id: number): boolean {
+  return db.prepare(`DELETE FROM people WHERE id = ? AND user_id = ?`).run(id, userId)
+    .changes > 0;
 }
 
 /* ── tags ───────────────────────────────────────────────────────── */
 
-export function upsertTag(db: DB, stemKey: string, display: string, lang: Lang): number {
-  const existing = db.prepare(`SELECT id FROM tags WHERE stem = ?`).get(stemKey) as
-    | { id: number }
-    | undefined;
+export function upsertTag(
+  db: DB,
+  userId: number,
+  stemKey: string,
+  display: string,
+  lang: Lang,
+): number {
+  const existing = db
+    .prepare(`SELECT id FROM tags WHERE stem = ? AND user_id = ?`)
+    .get(stemKey, userId) as { id: number } | undefined;
   if (existing) return existing.id;
   const info = db
-    .prepare(`INSERT INTO tags (stem, display, lang) VALUES (?, ?, ?)`)
-    .run(stemKey, display, lang);
+    .prepare(`INSERT INTO tags (user_id, stem, display, lang) VALUES (?, ?, ?, ?)`)
+    .run(userId, stemKey, display, lang);
   return Number(info.lastInsertRowid);
 }
 
 /* ── cues ───────────────────────────────────────────────────────── */
 
-export function listCues(db: DB): Cue[] {
+export function listCues(db: DB, userId: number): Cue[] {
   const rows = db
-    .prepare(`SELECT * FROM cues ORDER BY track, lang, stem`)
-    .all() as {
+    .prepare(`SELECT * FROM cues WHERE user_id = ? ORDER BY track, lang, stem`)
+    .all(userId) as {
     id: number;
     lang: string;
     track: string;
@@ -521,29 +681,31 @@ export function listCues(db: DB): Cue[] {
 
 export function upsertCue(
   db: DB,
+  userId: number,
   cue: { lang: Lang; track: TrackKey; stem: string; weight: number; source?: Cue["source"] },
 ): void {
   db.prepare(
-    `INSERT INTO cues (lang, track, stem, weight, seed_weight, source)
-     VALUES (?, ?, ?, ?, ?, ?)
-     ON CONFLICT(lang, track, stem) DO UPDATE SET
+    `INSERT INTO cues (user_id, lang, track, stem, weight, seed_weight, source)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(user_id, lang, track, stem) DO UPDATE SET
        weight = excluded.weight,
        source = excluded.source`,
-  ).run(cue.lang, cue.track, cue.stem, cue.weight, cue.weight, cue.source ?? "user");
+  ).run(userId, cue.lang, cue.track, cue.stem, cue.weight, cue.weight, cue.source ?? "user");
 }
 
-export function deleteCue(db: DB, id: number): boolean {
-  return db.prepare(`DELETE FROM cues WHERE id = ?`).run(id).changes > 0;
+export function deleteCue(db: DB, userId: number, id: number): boolean {
+  return db.prepare(`DELETE FROM cues WHERE id = ? AND user_id = ?`).run(id, userId)
+    .changes > 0;
 }
 
-export function resetCue(db: DB, id: number): boolean {
+export function resetCue(db: DB, userId: number, id: number): boolean {
   return (
     db
       .prepare(
         `UPDATE cues SET weight = seed_weight, source = 'seed'
-         WHERE id = ? AND seed_weight IS NOT NULL`,
+         WHERE id = ? AND user_id = ? AND seed_weight IS NOT NULL`,
       )
-      .run(id).changes > 0
+      .run(id, userId).changes > 0
   );
 }
 
@@ -558,6 +720,7 @@ export const WEIGHT_BOUNDS = { min: 0, max: 6 } as const;
 
 export function learnFromCorrection(
   db: DB,
+  userId: number,
   opts: {
     entryId: number | null;
     lang: Lang;
@@ -573,8 +736,13 @@ export function learnFromCorrection(
   db.transaction(() => {
     for (const s of opts.stems) {
       const row = db
-        .prepare(`SELECT id, weight FROM cues WHERE lang = ? AND track = ? AND stem = ?`)
-        .get(opts.lang, opts.track, s) as { id: number; weight: number } | undefined;
+        .prepare(
+          `SELECT id, weight FROM cues
+           WHERE user_id = ? AND lang = ? AND track = ? AND stem = ?`,
+        )
+        .get(userId, opts.lang, opts.track, s) as
+        | { id: number; weight: number }
+        | undefined;
 
       if (!row) {
         // A word you corrected that isn't in the lexicon becomes a new cue,
@@ -582,9 +750,9 @@ export function learnFromCorrection(
         // in order to immediately mute it.
         if (opts.delta <= 0) continue;
         db.prepare(
-          `INSERT OR IGNORE INTO cues (lang, track, stem, weight, seed_weight, source)
-           VALUES (?, ?, ?, ?, 0, 'learned')`,
-        ).run(opts.lang, opts.track, s, Math.min(WEIGHT_BOUNDS.max, Math.abs(step)));
+          `INSERT OR IGNORE INTO cues (user_id, lang, track, stem, weight, seed_weight, source)
+           VALUES (?, ?, ?, ?, ?, 0, 'learned')`,
+        ).run(userId, opts.lang, opts.track, s, Math.min(WEIGHT_BOUNDS.max, Math.abs(step)));
         continue;
       }
 
@@ -605,8 +773,10 @@ export function learnFromCorrection(
 
 /* ── quests ─────────────────────────────────────────────────────── */
 
-export function listQuests(db: DB): Quest[] {
-  const rows = db.prepare(`SELECT * FROM quests ORDER BY created_at DESC`).all() as {
+export function listQuests(db: DB, userId: number): Quest[] {
+  const rows = db
+    .prepare(`SELECT * FROM quests WHERE user_id = ? ORDER BY created_at DESC`)
+    .all(userId) as {
     id: number;
     title: string;
     tracks: string;
@@ -628,35 +798,58 @@ export function listQuests(db: DB): Quest[] {
 
 export function insertQuest(
   db: DB,
+  userId: number,
   q: { title: string; tracks: TrackKey[]; targetDate: string | null; xpTarget: number | null },
 ): Quest {
   const info = db
     .prepare(
-      `INSERT INTO quests (title, tracks, created_at, target_date, status, xp_target)
-       VALUES (?, ?, ?, ?, 'active', ?)`,
+      `INSERT INTO quests (user_id, title, tracks, created_at, target_date, status, xp_target)
+       VALUES (?, ?, ?, ?, ?, 'active', ?)`,
     )
     .run(
+      userId,
       q.title,
       JSON.stringify(q.tracks),
       new Date().toISOString(),
       q.targetDate,
       q.xpTarget,
     );
-  return listQuests(db).find((x) => x.id === Number(info.lastInsertRowid))!;
+  return listQuests(db, userId).find((x) => x.id === Number(info.lastInsertRowid))!;
 }
 
-export function updateQuestStatus(db: DB, id: number, status: Quest["status"]): boolean {
-  return db.prepare(`UPDATE quests SET status = ? WHERE id = ?`).run(status, id).changes > 0;
+export function updateQuestStatus(
+  db: DB,
+  userId: number,
+  id: number,
+  status: Quest["status"],
+): boolean {
+  return db
+    .prepare(`UPDATE quests SET status = ? WHERE id = ? AND user_id = ?`)
+    .run(status, id, userId).changes > 0;
 }
 
-export function deleteQuest(db: DB, id: number): boolean {
-  return db.prepare(`DELETE FROM quests WHERE id = ?`).run(id).changes > 0;
+export function deleteQuest(db: DB, userId: number, id: number): boolean {
+  return db.prepare(`DELETE FROM quests WHERE id = ? AND user_id = ?`).run(id, userId)
+    .changes > 0;
 }
 
+/**
+ * Both sides of the link are re-checked against the owner, so a link can never
+ * be forged between one account's quest and another's entry.
+ */
 export function linkQuest(
   db: DB,
+  userId: number,
   link: { questId: number; entryId: number; confidence: number; evidence: string },
 ): void {
+  const owned = db
+    .prepare(
+      `SELECT 1 FROM quests q JOIN entries e ON e.user_id = q.user_id
+       WHERE q.id = ? AND e.id = ? AND q.user_id = ?`,
+    )
+    .get(link.questId, link.entryId, userId);
+  if (!owned) return;
+
   db.prepare(
     `INSERT INTO quest_links (quest_id, entry_id, confidence, evidence)
      VALUES (?, ?, ?, ?)
@@ -665,32 +858,37 @@ export function linkQuest(
   ).run(link.questId, link.entryId, link.confidence, link.evidence);
 }
 
-export function unlinkQuest(db: DB, questId: number, entryId: number): void {
-  db.prepare(`DELETE FROM quest_links WHERE quest_id = ? AND entry_id = ?`).run(
-    questId,
-    entryId,
-  );
+export function unlinkQuest(
+  db: DB,
+  userId: number,
+  questId: number,
+  entryId: number,
+): void {
+  db.prepare(
+    `DELETE FROM quest_links WHERE quest_id = ? AND entry_id = ?
+     AND quest_id IN (SELECT id FROM quests WHERE user_id = ?)`,
+  ).run(questId, entryId, userId);
 }
 
-export function questLinkedEntries(db: DB, questId: number): Entry[] {
+export function questLinkedEntries(db: DB, userId: number, questId: number): Entry[] {
   const rows = db
     .prepare(
       `SELECT e.* FROM entries e
        JOIN quest_links ql ON ql.entry_id = e.id
-       WHERE ql.quest_id = ? ORDER BY e.date`,
+       WHERE ql.quest_id = ? AND e.user_id = ? ORDER BY e.date`,
     )
-    .all(questId) as EntryRow[];
+    .all(questId, userId) as EntryRow[];
   return hydrate(db, rows);
 }
 
-export function questLinksFor(db: DB, entryId: number) {
+export function questLinksFor(db: DB, userId: number, entryId: number) {
   return db
     .prepare(
       `SELECT ql.quest_id AS questId, ql.confidence, ql.evidence, q.title
        FROM quest_links ql JOIN quests q ON q.id = ql.quest_id
-       WHERE ql.entry_id = ?`,
+       WHERE ql.entry_id = ? AND q.user_id = ?`,
     )
-    .all(entryId) as {
+    .all(entryId, userId) as {
     questId: number;
     confidence: number;
     evidence: string;
@@ -700,11 +898,12 @@ export function questLinksFor(db: DB, entryId: number) {
 
 /* ── alerts ─────────────────────────────────────────────────────── */
 
-export function listAlerts(db: DB, includeDismissed = false): Alert[] {
+export function listAlerts(db: DB, userId: number, includeDismissed = false): Alert[] {
   const sql = includeDismissed
-    ? `SELECT * FROM alerts ORDER BY triggered_at DESC`
-    : `SELECT * FROM alerts WHERE dismissed_at IS NULL ORDER BY triggered_at DESC`;
-  const rows = db.prepare(sql).all() as {
+    ? `SELECT * FROM alerts WHERE user_id = ? ORDER BY triggered_at DESC`
+    : `SELECT * FROM alerts WHERE user_id = ? AND dismissed_at IS NULL
+       ORDER BY triggered_at DESC`;
+  const rows = db.prepare(sql).all(userId) as {
     id: number;
     track: string;
     kind: string;
@@ -726,55 +925,73 @@ export function listAlerts(db: DB, includeDismissed = false): Alert[] {
 
 export function insertAlert(
   db: DB,
+  userId: number,
   a: { track: TrackKey; kind: Alert["kind"]; peak: number; current: number },
 ): void {
   db.prepare(
-    `INSERT INTO alerts (track, kind, peak, current, triggered_at)
-     VALUES (?, ?, ?, ?, ?)`,
-  ).run(a.track, a.kind, a.peak, a.current, new Date().toISOString());
+    `INSERT INTO alerts (user_id, track, kind, peak, current, triggered_at)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(userId, a.track, a.kind, a.peak, a.current, new Date().toISOString());
 }
 
-export function dismissAlert(db: DB, id: number): boolean {
+export function dismissAlert(db: DB, userId: number, id: number): boolean {
   return (
     db
-      .prepare(`UPDATE alerts SET dismissed_at = ? WHERE id = ? AND dismissed_at IS NULL`)
-      .run(new Date().toISOString(), id).changes > 0
+      .prepare(
+        `UPDATE alerts SET dismissed_at = ?
+         WHERE id = ? AND user_id = ? AND dismissed_at IS NULL`,
+      )
+      .run(new Date().toISOString(), id, userId).changes > 0
   );
 }
 
 /** Clear alerts for a recovered track so a future fall can report again. */
-export function clearAlertsFor(db: DB, track: TrackKey, kind: Alert["kind"]): void {
-  db.prepare(`DELETE FROM alerts WHERE track = ? AND kind = ?`).run(track, kind);
+export function clearAlertsFor(
+  db: DB,
+  userId: number,
+  track: TrackKey,
+  kind: Alert["kind"],
+): void {
+  db.prepare(`DELETE FROM alerts WHERE user_id = ? AND track = ? AND kind = ?`).run(
+    userId,
+    track,
+    kind,
+  );
 }
 
 /* ── reviews cache ──────────────────────────────────────────────── */
 
 export function getCachedReview(
   db: DB,
+  userId: number,
   weekStart: string,
   hash: string,
 ): unknown | null {
   const row = db
-    .prepare(`SELECT findings, entries_hash FROM reviews WHERE week_start = ?`)
-    .get(weekStart) as { findings: string; entries_hash: string } | undefined;
+    .prepare(
+      `SELECT findings, entries_hash FROM reviews
+       WHERE user_id = ? AND week_start = ?`,
+    )
+    .get(userId, weekStart) as { findings: string; entries_hash: string } | undefined;
   if (!row || row.entries_hash !== hash) return null;
   return safeJson<unknown>(row.findings, null);
 }
 
 export function putCachedReview(
   db: DB,
+  userId: number,
   weekStart: string,
   hash: string,
   payload: unknown,
 ): void {
   db.prepare(
-    `INSERT INTO reviews (week_start, entries_hash, findings, built_at)
-     VALUES (?, ?, ?, ?)
-     ON CONFLICT(week_start) DO UPDATE SET
+    `INSERT INTO reviews (user_id, week_start, entries_hash, findings, built_at)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(user_id, week_start) DO UPDATE SET
        entries_hash = excluded.entries_hash,
        findings = excluded.findings,
        built_at = excluded.built_at`,
-  ).run(weekStart, hash, JSON.stringify(payload), new Date().toISOString());
+  ).run(userId, weekStart, hash, JSON.stringify(payload), new Date().toISOString());
 }
 
 /* ── search ─────────────────────────────────────────────────────── */
@@ -791,7 +1008,12 @@ export interface SearchHit {
  * is quoted, so a stray `"` or `*` from the search box can't become a syntax
  * error — or worse, a wildcard that matches the entire journal.
  */
-export function searchEntries(db: DB, query: string, limit = 100): SearchHit[] {
+export function searchEntries(
+  db: DB,
+  userId: number,
+  query: string,
+  limit = 100,
+): SearchHit[] {
   const terms = query
     .split(/\s+/)
     .map((t) => t.replace(/["*(){}:^-]/g, "").trim())
@@ -800,17 +1022,135 @@ export function searchEntries(db: DB, query: string, limit = 100): SearchHit[] {
 
   if (terms.length === 0) return [];
 
+  // The FTS index spans every account — it is keyed on entry rowid and knows
+  // nothing about ownership. The user_id predicate on the joined table is the
+  // only thing separating your search results from someone else's diary, so it
+  // must never be dropped from this query.
   const rows = db
     .prepare(
       `SELECT e.*, snippet(entries_fts, 0, '⟦', '⟧', '…', 18) AS snippet
        FROM entries_fts f JOIN entries e ON e.id = f.rowid
-       WHERE entries_fts MATCH ?
+       WHERE entries_fts MATCH ? AND e.user_id = ?
        ORDER BY rank LIMIT ?`,
     )
-    .all(terms.join(" AND "), limit) as (EntryRow & { snippet: string })[];
+    .all(terms.join(" AND "), userId, limit) as (EntryRow & { snippet: string })[];
 
   const entries = hydrate(db, rows);
   return rows.map((r, i) => ({ entry: entries[i]!, snippet: r.snippet }));
+}
+
+/* ── scores (the leaderboard's only source) ─────────────────────── */
+
+export interface ScoreRow {
+  track: string;
+  momentum: number;
+  lifetime: number;
+  level: number;
+  streak: number;
+  entryCount: number;
+}
+
+export interface BoardRow extends ScoreRow {
+  userId: number;
+  display: string;
+  updatedAt: string;
+}
+
+/** The overall row's pseudo-track. Not a real track, so it can't collide. */
+export const OVERALL = "_overall";
+
+export function writeScores(db: DB, userId: number, rows: readonly ScoreRow[]): void {
+  const stmt = db.prepare(
+    `INSERT INTO scores (user_id, track, momentum, lifetime, level, streak, entry_count, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(user_id, track) DO UPDATE SET
+       momentum = excluded.momentum, lifetime = excluded.lifetime,
+       level = excluded.level, streak = excluded.streak,
+       entry_count = excluded.entry_count, updated_at = excluded.updated_at`,
+  );
+  const now = new Date().toISOString();
+  db.transaction(() => {
+    for (const r of rows) {
+      stmt.run(userId, r.track, r.momentum, r.lifetime, r.level, r.streak, r.entryCount, now);
+    }
+  })();
+}
+
+/**
+ * The leaderboard.
+ *
+ * Reads `scores` and `users` and nothing else — no join reaches `entries`,
+ * which is what makes it structurally incapable of exposing anyone's writing.
+ * Accounts that opted out are filtered here rather than in the caller.
+ */
+/**
+ * One account's own row, ignoring its sharing preference.
+ *
+ * Opting out hides you from everyone else, not from yourself — without this
+ * the board would go blank for the very people most deliberate about privacy.
+ */
+export function readOwnScore(db: DB, userId: number, track: string = OVERALL): BoardRow | null {
+  const r = db
+    .prepare(
+      `SELECT s.user_id, s.track, s.momentum, s.lifetime, s.level, s.streak,
+              s.entry_count, s.updated_at, u.display
+       FROM scores s JOIN users u ON u.id = s.user_id
+       WHERE s.user_id = ? AND s.track = ?`,
+    )
+    .get(userId, track) as
+    | {
+        user_id: number; track: string; momentum: number; lifetime: number;
+        level: number; streak: number; entry_count: number;
+        updated_at: string; display: string;
+      }
+    | undefined;
+
+  if (!r) return null;
+  return {
+    userId: r.user_id,
+    display: r.display,
+    track: r.track,
+    momentum: Number(r.momentum.toFixed(2)),
+    lifetime: r.lifetime,
+    level: r.level,
+    streak: r.streak,
+    entryCount: r.entry_count,
+    updatedAt: r.updated_at,
+  };
+}
+
+export function readBoard(db: DB, track: string = OVERALL): BoardRow[] {
+  const rows = db
+    .prepare(
+      `SELECT s.user_id, s.track, s.momentum, s.lifetime, s.level, s.streak,
+              s.entry_count, s.updated_at, u.display
+       FROM scores s JOIN users u ON u.id = s.user_id
+       WHERE s.track = ? AND u.share_scores = 1
+       ORDER BY s.momentum DESC, s.lifetime DESC, u.display`,
+    )
+    .all(track) as {
+    user_id: number;
+    track: string;
+    momentum: number;
+    lifetime: number;
+    level: number;
+    streak: number;
+    entry_count: number;
+    updated_at: string;
+    display: string;
+  }[];
+
+  return rows.map((r) => ({
+    userId: r.user_id,
+    display: r.display,
+    track: r.track,
+    momentum: Number(r.momentum.toFixed(2)),
+    lifetime: r.lifetime,
+    level: r.level,
+    streak: r.streak,
+    entryCount: r.entry_count,
+    updatedAt: r.updated_at,
+  }));
 }
 
 /* ── util ───────────────────────────────────────────────────────── */

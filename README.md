@@ -8,14 +8,17 @@ what you actually wrote. XP decays with a 14-day half-life, so **momentum**
 reflects the recent past rather than a lifetime total: a track you've stopped
 feeding goes cold whether or not you once had a hundred good days in it.
 
-Everything runs on your machine. There is no account, no API key, and no
-network call to anywhere. Quantification is a local rule engine you can read,
-edit, and teach.
+There is no API key and no model in the loop. Quantification is a local rule
+engine you can read, edit, and teach.
 
 ```bash
 npm install
 npm run dev          # api on :8787, app on http://localhost:5173
 ```
+
+Run it on your own machine and nothing leaves it. Deployed to a server, one
+thing does — see [Accounts and the shared board](#accounts-and-the-shared-board)
+for exactly what, and [Deploying](#deploying) for how.
 
 ## How the numbers are made
 
@@ -129,6 +132,95 @@ DB_PATH=./data/dev.db npm run preview   # render populated tabs to preview.html
 The seeded history deliberately contains findable truths: Spirit burns for six
 weeks then stops dead, someone disappears from the record halfway through, and
 a short night genuinely predicts a flat tomorrow.
+
+## Accounts and the shared board
+
+Zapis is multi-user, for one reason: a leaderboard needs more than one person.
+Nothing else about it is shared.
+
+Each account gets its own journal, its own people registry, its own settings,
+and **its own copy of the lexicon** — so teaching the engine that *deploy* means
+Craft tunes your extraction and nobody else's. Every query in `server/db.ts`
+takes an explicit user id; there is no ambient "current user" anywhere in the
+process.
+
+### What the board shows
+
+One table, ranked by **momentum**, not lifetime XP. Lifetime would mean whoever
+started first wins permanently and the board goes static; momentum decays, so it
+measures whether you are showing up *now* and a newcomer can top it in a week.
+
+Overall momentum is the **mean of the seven tracks**, not their sum. Summing
+would let one obsessive track carry the whole board, which inverts what this app
+is for — the radar's area is the point, not its longest spoke.
+
+What another person can see about you:
+
+| Shared | Never shared |
+|---|---|
+| Display name | Anything you wrote |
+| Momentum, per track and overall | Entry dates, mood, energy |
+| Level and lifetime XP | People, tags, events, quests |
+| Current streak, entry count | Your lexicon and its corrections |
+
+This is enforced structurally rather than carefully. The board reads from a
+`scores` table that has **no text column at all** and is forbidden from joining
+against `entries` — a careful `SELECT` is one refactor away from leaking, a
+table with nowhere to put prose is not. Settings → *Appear on the shared board*
+opts out entirely; you still see your own numbers when hidden.
+
+### Accounts
+
+Registration requires `ZAPIS_INVITE_CODE`, and **is refused outright when that
+variable is unset** — a deployment you forgot to configure is closed rather than
+open to the internet. Passwords are scrypt-hashed locally; sessions are opaque
+random tokens in an httpOnly cookie, checked against a table.
+
+```bash
+npm run user -- list                                  # accounts, and who's locked
+npm run user -- add ana "Ana" <password>              # create one directly
+npm run user -- passwd ana <password>                 # set or reset a password
+npm run user -- rename ana "Ana P."                   # change the board name
+```
+
+### Upgrading a journal that predates accounts
+
+The migration adopts your existing entries onto user 1, handle `me`, with an
+**empty password hash — which no login accepts**. Set one before you can sign
+in:
+
+```bash
+npm run user -- passwd me <password>
+```
+
+Everything else — entries, awards, people, cues, settings, and the full-text
+index — is carried over in place. Back up `data/zapis.db` first anyway; the
+migration rebuilds every table.
+
+## Deploying
+
+One container: the API and the built frontend on a single port, with SQLite on
+a mounted volume.
+
+```bash
+fly launch --no-deploy                 # or edit the app name in fly.toml
+fly volumes create zapis_data --size 1
+fly secrets set ZAPIS_INVITE_CODE=<something-only-your-friends-get>
+fly deploy
+fly ssh console -C "npx tsx scripts/user.ts passwd me <password>"
+```
+
+Notes that matter:
+
+- **Keep it to one machine.** `min_machines_running` is 0 and there is no
+  `[[vm]]` count above one deliberately — two machines would each open their own
+  copy of the SQLite file on their own volume and silently diverge into two
+  different journals.
+- **The volume is the journal.** Without `[mounts]`, a redeploy wipes it.
+- `NODE_ENV=production` turns on secure cookies, trusts the proxy's forwarded
+  headers, and serves `dist/`. The Dockerfile sets it.
+- Anything with a persistent disk works the same way — Railway, Render, a VPS.
+  Serverless platforms do not: an ephemeral filesystem loses the database.
 
 ## Notes and limits
 

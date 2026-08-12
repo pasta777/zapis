@@ -13,6 +13,9 @@ export default defineConfig({
   test: {
     globals: true,
     environment: "node",
-    include: ["src/**/*.test.ts", "src/**/*.test.tsx", "corpus/**/*.test.ts"],
+    include: [
+      "src/**/*.test.ts", "src/**/*.test.tsx",
+      "server/**/*.test.ts", "corpus/**/*.test.ts",
+    ],
   },
 });

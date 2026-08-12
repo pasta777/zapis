@@ -12,14 +12,28 @@ import type {
 
 const BASE = "/api";
 
+/** Thrown for a 401, so the app can drop to the sign-in screen. */
+export class NotAuthedError extends Error {
+  constructor() {
+    super("not signed in");
+    this.name = "NotAuthedError";
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     ...init,
+    // The session cookie is httpOnly, so it rides on the request rather than
+    // being read by this code. Same-origin in production; in dev Vite proxies
+    // /api, which keeps it same-origin there too.
+    credentials: "same-origin",
     headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
   });
 
   const text = await res.text();
   if (!res.ok) {
+    if (res.status === 401) throw new NotAuthedError();
+
     let message = `${res.status} ${res.statusText}`;
     try {
       const body = JSON.parse(text) as { error?: string };
@@ -99,6 +113,37 @@ export interface ImportPreview {
   }[];
 }
 
+export interface Account {
+  id: number;
+  handle: string;
+  display: string;
+  shareScores: boolean;
+  createdAt: string;
+}
+
+/** One row of the shared board. Numbers and a display name; nothing else. */
+export interface BoardRow {
+  rank: number;
+  userId: number;
+  display: string;
+  track: string;
+  momentum: number;
+  lifetime: number;
+  level: number;
+  streak: number;
+  entryCount: number;
+  updatedAt: string;
+}
+
+export interface LeaderboardResponse {
+  track: string;
+  you: Omit<BoardRow, "rank"> | null;
+  sharing: boolean;
+  rows: BoardRow[];
+}
+
+export type AccountSettings = Settings & { shareScores: boolean };
+
 export interface EntryPayload {
   date: string;
   text: string;
@@ -118,7 +163,23 @@ export interface EntryPayload {
 /* ── the client ─────────────────────────────────────────────────── */
 
 export const api = {
-  health: () => get<{ ok: boolean; entries: number; db: string }>("/health"),
+  health: () => get<{ ok: boolean; db: string }>("/health"),
+
+  me: () => get<{ user: Account }>("/auth/me"),
+  login: (handle: string, password: string) =>
+    post<{ user: Account }>("/auth/login", { handle, password }),
+  register: (input: {
+    handle: string;
+    display: string;
+    password: string;
+    invite: string;
+  }) => post<{ user: Account }>("/auth/register", input),
+  logout: () => post<{ ok: boolean }>("/auth/logout"),
+
+  leaderboard: (track?: string) =>
+    get<LeaderboardResponse>(
+      `/leaderboard${track ? `?track=${encodeURIComponent(track)}` : ""}`,
+    ),
 
   extract: (text: string, date?: string) =>
     post<ExtractResponse>("/extract", { text, date }),
@@ -170,8 +231,9 @@ export const api = {
   onThisDay: () =>
     get<{ monthAgo: Entry | null; yearAgo: Entry | null }>("/onthisday"),
 
-  settings: () => get<Settings>("/settings"),
-  saveSettings: (patch: Partial<Settings>) => put<Settings>("/settings", patch),
+  settings: () => get<AccountSettings>("/settings"),
+  saveSettings: (patch: Partial<AccountSettings>) =>
+    put<AccountSettings>("/settings", patch),
 
   exportUrl: (format: "json" | "csv" | "md") => `${BASE}/export?format=${format}`,
   importPreview: (raw: string) => post<ImportPreview>("/import/preview", { raw }),

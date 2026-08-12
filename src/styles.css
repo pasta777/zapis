@@ -674,3 +674,120 @@ body {
   .ll-award.zero { opacity: 0.45; }
   .ll-readout { opacity: 1; }
 }
+
+/* ── accounts & the shared board ─────────────────────────────────── */
+
+.ll-gate { min-height: 100vh; }
+
+.ll-signin {
+  max-width: 380px;
+  margin: 56px auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  background: var(--panel);
+  padding: 32px 28px;
+}
+.ll-signin h2 {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--dim);
+  font-weight: 400;
+}
+
+.ll-field { display: flex; flex-direction: column; gap: 6px; }
+.ll-field > span {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+.ll-field input {
+  background: var(--ink);
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  color: var(--bone);
+  font-family: var(--serif);
+  font-size: 16px;
+  padding: 10px 12px;
+}
+.ll-field input:focus {
+  outline: none;
+  border-color: var(--brass);
+}
+
+.ll-primary {
+  background: var(--brass);
+  color: #12161f;
+  border: 0;
+  border-radius: 2px;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.19em;
+  text-transform: uppercase;
+  padding: 13px 24px;
+  cursor: pointer;
+  transition: opacity 0.2s;
+}
+.ll-primary:hover { opacity: 0.87; }
+.ll-primary:disabled { opacity: 0.42; cursor: default; }
+
+.ll-who {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.12em;
+  color: var(--bone);
+}
+
+.ll-chip { background: none; cursor: pointer; }
+.ll-chip.on { color: var(--brass); border-color: var(--brass); }
+
+.ll-board {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 20px;
+  font-size: 15px;
+}
+.ll-board th {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--dim);
+  font-weight: 400;
+  text-align: left;
+  padding: 0 12px 10px 0;
+  border-bottom: 1px solid var(--rule);
+}
+.ll-board td {
+  padding: 12px 12px 12px 0;
+  border-bottom: 1px solid var(--rule);
+  color: var(--bone);
+}
+.ll-board th.num, .ll-board td.num {
+  text-align: right;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.ll-board tr.you td { color: var(--brass); }
+.ll-you {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: var(--brass);
+}
+.ll-band {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--dim);
+  margin-left: 7px;
+}
